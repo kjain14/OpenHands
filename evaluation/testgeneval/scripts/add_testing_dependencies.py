@@ -38,7 +38,7 @@ RUN rm {datum['test_file']}
     if image_type == 'full':
         dockerfile_content += "RUN git add .\nRUN git commit -m \"Testing fixes\""
     elif image_type in ['first', 'last', 'extra']:
-        dockerfile_content += f"COPY {preds_path[image_type]} {datum['test_file']}\nRUNRUN git add .\nRUN git commit -m \"Testing fixes\""
+        dockerfile_content += f"COPY {preds_path[image_type]} {datum['test_file']}\nRUN git add .\nRUN git commit -m \"Testing fixes\""
 
     return dockerfile_content
 
@@ -57,7 +57,7 @@ def build_and_push_image(dockerfile_content, image_name):
 def process_images(dataset, original_namespace, new_namespace):
     dependencies = ['coverage', 'cosmic-ray']
 
-    for datum in dataset.select(range(1)):
+    for datum in dataset:
         full_image_name = f'{original_namespace}/sweb.eval.x86_64.{datum["instance_id"].replace("__", "_s_")}:latest'
         print(f'Processing image: {full_image_name}')
         run_command(f'docker pull {full_image_name}')
