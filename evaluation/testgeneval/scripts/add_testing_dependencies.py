@@ -1,6 +1,7 @@
 import argparse
 import os
 import subprocess
+from datasets import load_dataset
 
 
 # Function to run shell commands
@@ -17,80 +18,96 @@ def docker_login():
     run_command('docker login')
 
 
+# Function to generate Dockerfile content based on image type
+def generate_dockerfile_content(base_image, dependencies, datum, image_type, patch_path, test_patch_path, preds_path):
+    dockerfile_content = f"""
+FROM {base_image}
+RUN pip install {' '.join(dependencies)}
+COPY {patch_path} /app/patch.diff
+RUN git apply /app/patch.diff
+RUN rm /app/patch.diff
+COPY {test_patch_path} /app/patch.diff
+RUN git apply /app/patch.diff
+RUN git config --global user.email ""
+RUN git config --global user.name "TestGenEval"
+RUN rm /app/patch.diff
+RUN rm {datum['test_file']}
+"""
+
+    # Add specific content based on image type
+    if image_type == 'full':
+        dockerfile_content += "RUN git add .\nRUN git commit -m \"Testing fixes\""
+    elif image_type in ['first', 'last', 'extra']:
+        dockerfile_content += f"COPY {preds_path[image_type]} {datum['test_file']}\nRUNRUN git add .\nRUN git commit -m \"Testing fixes\""
+
+    return dockerfile_content
+
+
+# Function to build, push, and clean up Docker images
+def build_and_push_image(dockerfile_content, image_name):
+    with open('Dockerfile.temp', 'w') as dockerfile:
+        dockerfile.write(dockerfile_content)
+    run_command(f'docker build -f Dockerfile.temp -t {image_name} .')
+    run_command(f'docker push {image_name}')
+    run_command(f'docker rmi {image_name}')
+    os.remove('Dockerfile.temp')
+
+
 # Function to process images with .eval in the name
-def process_images(file_path, original_namespace, new_namespace):
-    # Define testing dependencies
+def process_images(dataset, original_namespace, new_namespace):
     dependencies = ['coverage', 'cosmic-ray']
 
-    with open(file_path, 'r') as file:
-        for line in file:
-            image = line.strip()
-            if '.eval' in image:
-                # Ensure image is fully qualified with the original namespace
-                full_image_name = (
-                    f'{original_namespace}/{image}'
-                    if original_namespace not in image
-                    else image
-                )
-                print(f'Processing image: {full_image_name}')
+    for datum in dataset.select(range(1)):
+        full_image_name = f'{original_namespace}/sweb.eval.x86_64.{datum["instance_id"].replace("__", "_s_")}:latest'
+        print(f'Processing image: {full_image_name}')
+        run_command(f'docker pull {full_image_name}')
 
-                # Pull the original image
-                run_command(f'docker pull {full_image_name}')
+        # Save patches and preds_context to regular files
+        patch_file_path = 'patch.diff'
+        test_patch_file_path = 'test_patch.diff'
+        preds_paths = {
+            'first': 'preds_first.txt',
+            'last': 'preds_last_minus_one.txt',
+            'extra': 'preds_last.txt'
+        }
 
-                # Tag the image to the new namespace
-                base_name = image.split('/')[-1].replace('.eval', '')
-                new_image_name = f'{new_namespace}/{base_name}'
-                run_command(f'docker tag {full_image_name} {new_image_name}')
+        with open(patch_file_path, 'w') as patch_file, \
+             open(test_patch_file_path, 'w') as test_patch_file, \
+             open(preds_paths['first'], 'w') as first_file, \
+             open(preds_paths['last'], 'w') as last_minus_one_file, \
+             open(preds_paths['extra'], 'w') as last_file:
 
-                # Create Dockerfile content dynamically
-                dockerfile_content = f"""
-                FROM {full_image_name}
-                RUN pip install {' '.join(dependencies)}
-                """
+            patch_file.write(datum['patch'])
+            test_patch_file.write(datum['test_patch'])
+            first_file.write(datum['preds_context']['first'])
+            last_minus_one_file.write(datum['preds_context']['last_minus_one'])
+            last_file.write(datum['preds_context']['last'])
 
-                # Write Dockerfile to a temporary file
-                with open('Dockerfile.temp', 'w') as dockerfile:
-                    dockerfile.write(dockerfile_content)
+        # Define image types and corresponding tags
+        image_types = ['full', 'first', 'last', 'extra']
+        for image_type in image_types:
+            new_image_name = f'{new_namespace}/sweb.eval.x86_64.{datum["instance_id"].replace("__", "_s_")}_{image_type}:latest'
+            dockerfile_content = generate_dockerfile_content(full_image_name, dependencies, datum, image_type, patch_file_path, test_patch_file_path, preds_paths)
+            build_and_push_image(dockerfile_content, new_image_name)
 
-                # Build the new image with dependencies
-                run_command(f'docker build -f Dockerfile.temp -t {new_image_name} .')
-
-                # Push the new image to the Docker Hub
-                run_command(f'docker push {new_image_name}')
-
-                # Clean up: remove the local images and Dockerfile
-                run_command(f'docker rmi {new_image_name} {full_image_name}')
-                os.remove('Dockerfile.temp')
+        # Cleanup regular files and images
+        os.remove(patch_file_path)
+        os.remove(test_patch_file_path)
+        os.remove(preds_paths['first'])
+        os.remove(preds_paths['last'])
+        os.remove(preds_paths['extra'])
+        run_command(f'docker rmi {full_image_name}')
 
 
 if __name__ == '__main__':
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(
-        description='Process Docker images with .eval in the name.'
-    )
-    parser.add_argument(
-        '--images_file',
-        type=str,
-        required=True,
-        help='Path to the file containing the list of images',
-    )
-    parser.add_argument(
-        '--new_namespace',
-        type=str,
-        default='kdjain',
-        help='The new Docker Hub namespace to push the images',
-    )
-    parser.add_argument(
-        '--original_namespace',
-        type=str,
-        default='xingyaoww',
-        help='The original Docker Hub namespace',
-    )
+    parser = argparse.ArgumentParser(description='Process Docker images with .eval in the name.')
+    parser.add_argument('--dataset', type=str, default='kjain14/testgeneval')
+    parser.add_argument('--split', type=str, default='test')
+    parser.add_argument('--new_namespace', type=str, default='kdjain', help='The new Docker Hub namespace to push the images')
+    parser.add_argument('--original_namespace', type=str, default='xingyaoww', help='The original Docker Hub namespace')
 
     args = parser.parse_args()
+    dataset = load_dataset(args.dataset)[args.split]
 
-    # Log in to Docker Hub
     docker_login()
-
-    # Process the images
-    process_images(args.images_file, args.original_namespace, args.new_namespace)
+    process_images(dataset, args.original_namespace, args.new_namespace)
