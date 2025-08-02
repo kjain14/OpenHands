@@ -1,5 +1,6 @@
 #!/bin/bash
 # SWE-Bench end-to-end evaluation script for SLURM with Pyxis
+# This script runs natively on the host but uses Pyxis containers for each instance
 # SBATCH directives are handled dynamically by the launcher script
 
 # Parse command line arguments
@@ -9,11 +10,10 @@ DATASET=$3
 SPLIT=$4
 MODE=${5:-swe}
 MAX_ITER=${6:-100}
-CONTAINER_IMAGE=${7:-"ghcr.io/openhands/openhands:latest"}
-EVAL_ENVIRONMENT=${8:-local}  # local or modal
+EVAL_ENVIRONMENT=${7:-local}  # local or modal
 
 if [ -z "$MODEL_CONFIG" ] || [ -z "$AGENT" ] || [ -z "$DATASET" ] || [ -z "$SPLIT" ]; then
-    echo "Usage: $0 MODEL_CONFIG AGENT DATASET SPLIT [MODE] [MAX_ITER] [CONTAINER_IMAGE] [EVAL_ENVIRONMENT]"
+    echo "Usage: $0 MODEL_CONFIG AGENT DATASET SPLIT [MODE] [MAX_ITER] [EVAL_ENVIRONMENT]"
     echo "Example: $0 llm-config.json CodeActAgent princeton-nlp/SWE-bench_Lite test"
     exit 1
 fi
@@ -32,18 +32,17 @@ export EVAL_OUTPUT_DIR="/workspace/evaluation_outputs/swe_bench_e2e_pyxis/job_${
 # Get instance ID for this array task
 INSTANCE_LIST_FILE="${WORK_DIR}/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}/instance_list.json"
 
-# On first run (task 0), create instance list
+# On first run (task 0), create instance list natively on host
 if [ $SLURM_ARRAY_TASK_ID -eq 0 ] && [ ! -f "$INSTANCE_LIST_FILE" ]; then
     mkdir -p $(dirname $INSTANCE_LIST_FILE)
     
-    # Run instance list creation in container
-    srun --container-image="$CONTAINER_IMAGE" \
-         --container-mounts="$OPENHANDS_ROOT:/workspace,$WORK_DIR/evaluation_outputs:/workspace/evaluation_outputs" \
-         --container-workdir="/workspace" \
-         python evaluation/benchmarks/swe_bench/scripts/slurm/create_instance_list.py \
+    # Run instance list creation directly on host
+    cd $OPENHANDS_ROOT
+    python evaluation/benchmarks/swe_bench/scripts/slurm/create_instance_list.py \
          --dataset "$DATASET" \
          --split "$SPLIT" \
-         --output "/workspace/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}/instance_list.json"
+         --output "${INSTANCE_LIST_FILE}"
+    cd $WORK_DIR
 fi
 
 # Wait for instance list to be created
@@ -59,7 +58,7 @@ if [ ! -f "$INSTANCE_LIST_FILE" ]; then
     exit 1
 fi
 
-# Get the specific instance for this array task
+# Get the specific instance for this array task (run on host)
 INSTANCE_ID=$(python -c "
 import json
 with open('$INSTANCE_LIST_FILE', 'r') as f:
@@ -75,6 +74,16 @@ fi
 
 echo "Processing instance: $INSTANCE_ID (task $SLURM_ARRAY_TASK_ID)"
 
+# Get the instance-specific Docker image
+INSTANCE_IMAGE=$(cd $OPENHANDS_ROOT && python -c "
+import sys
+sys.path.append('.')
+from evaluation.benchmarks.swe_bench.run_infer import get_instance_docker_image
+print(get_instance_docker_image('$INSTANCE_ID'))
+")
+
+echo "Using instance image: $INSTANCE_IMAGE"
+
 # =============================================================================
 # PHASE 1: INFERENCE - Run agent to generate solution
 # =============================================================================
@@ -82,8 +91,8 @@ echo "=========================================="
 echo "PHASE 1: Running inference for instance $INSTANCE_ID"
 echo "=========================================="
 
-# Run the inference in pyxis container with local runtime
-srun --container-image="$CONTAINER_IMAGE" \
+# Run the inference in the instance-specific pyxis container
+srun --container-image="$INSTANCE_IMAGE" \
      --container-mounts="$OPENHANDS_ROOT:/workspace,$WORK_DIR/evaluation_outputs:/workspace/evaluation_outputs" \
      --container-workdir="/workspace" \
      --container-env="INSTANCE_ID=$INSTANCE_ID,RUNTIME=local" \
@@ -158,59 +167,56 @@ if [ $SLURM_ARRAY_TASK_ID -eq $((SLURM_ARRAY_SIZE - 1)) ]; then
     
     echo "Running SWE-bench evaluation on aggregated results..."
     
-    # Run evaluation in container
-    srun --container-image="$CONTAINER_IMAGE" \
-         --container-mounts="$OPENHANDS_ROOT:/workspace,$WORK_DIR/evaluation_outputs:/workspace/evaluation_outputs" \
-         --container-workdir="/workspace" \
-         --container-env="DATASET=$DATASET,SPLIT=$SPLIT,EVAL_ENVIRONMENT=$EVAL_ENVIRONMENT" \
-         bash -c "
-             # Install swebench if not available
-             pip install swebench || echo 'swebench already installed or installation failed'
-             
-             # Convert to SWE-bench format if needed
-             python evaluation/benchmarks/swe_bench/scripts/eval/convert_oh_output_to_swe_json.py /workspace/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}/aggregated_output.jsonl
-             
-             # Get the converted file path
-             SWEBENCH_FORMAT_FILE=/workspace/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}/aggregated_output.swebench.jsonl
-             
-             if [ ! -f \"\$SWEBENCH_FORMAT_FILE\" ]; then
-                 echo 'Error: SWE-bench format conversion failed'
-                 exit 1
-             fi
-             
-             # Run SWE-bench evaluation
-             RUN_ID=\$(date +\"%Y%m%d_%H%M%S\")
-             MODAL_FLAG=\"\"
-             if [ \"$EVAL_ENVIRONMENT\" = \"modal\" ]; then
-                 MODAL_FLAG=\"--modal true\"
-             fi
-             
-             python -m swebench.harness.run_evaluation \
-                 --dataset_name \"$DATASET\" \
-                 --split \"$SPLIT\" \
-                 --predictions_path \"\$SWEBENCH_FORMAT_FILE\" \
-                 --timeout 3600 \
-                 --cache_level instance \
-                 --max_workers 4 \
-                 --run_id \"\$RUN_ID\" \
-                 \$MODAL_FLAG
-             
-             # Move results to output directory
-             MODEL_NAME_OR_PATH=\$(jq -r '.model_name_or_path' \"\$SWEBENCH_FORMAT_FILE\" | head -n 1)
-             RESULT_OUTPUT_DIR=/workspace/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}
-             
-             if [ -d \"logs/run_evaluation/\$RUN_ID/\$MODEL_NAME_OR_PATH\" ]; then
-                 mv \"logs/run_evaluation/\$RUN_ID/\$MODEL_NAME_OR_PATH\" \"\$RESULT_OUTPUT_DIR/eval_outputs\"
-                 echo \"\$RUN_ID\" > \"\$RESULT_OUTPUT_DIR/run_id.txt\"
-             fi
-             
-             # Move report file if it exists
-             if [ -f \"\$MODEL_NAME_OR_PATH.\$RUN_ID.json\" ]; then
-                 mv \"\$MODEL_NAME_OR_PATH.\$RUN_ID.json\" \"\$RESULT_OUTPUT_DIR/report.json\"
-             fi
-             
-             echo 'Evaluation completed successfully!'
-         "
+    # Run evaluation directly on the host
+    cd $OPENHANDS_ROOT
+    
+    # Install swebench if not available
+    pip install swebench || echo 'swebench already installed or installation failed'
+    
+    # Convert to SWE-bench format if needed
+    python evaluation/benchmarks/swe_bench/scripts/eval/convert_oh_output_to_swe_json.py "$AGGREGATED_OUTPUT"
+    
+    # Get the converted file path
+    SWEBENCH_FORMAT_FILE="${AGGREGATED_OUTPUT%.jsonl}.swebench.jsonl"
+    
+    if [ ! -f "$SWEBENCH_FORMAT_FILE" ]; then
+        echo 'Error: SWE-bench format conversion failed'
+        exit 1
+    fi
+    
+    # Run SWE-bench evaluation
+    RUN_ID=$(date +"%Y%m%d_%H%M%S")
+    MODAL_FLAG=""
+    if [ "$EVAL_ENVIRONMENT" = "modal" ]; then
+        MODAL_FLAG="--modal true"
+    fi
+    
+    python -m swebench.harness.run_evaluation \
+        --dataset_name "$DATASET" \
+        --split "$SPLIT" \
+        --predictions_path "$SWEBENCH_FORMAT_FILE" \
+        --timeout 3600 \
+        --cache_level instance \
+        --max_workers 4 \
+        --run_id "$RUN_ID" \
+        $MODAL_FLAG
+    
+    # Move results to output directory
+    MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' "$SWEBENCH_FORMAT_FILE" | head -n 1)
+    RESULT_OUTPUT_DIR="${WORK_DIR}/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}"
+    
+    if [ -d "logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH" ]; then
+        mv "logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH" "$RESULT_OUTPUT_DIR/eval_outputs"
+        echo "$RUN_ID" > "$RESULT_OUTPUT_DIR/run_id.txt"
+    fi
+    
+    # Move report file if it exists
+    if [ -f "$MODEL_NAME_OR_PATH.$RUN_ID.json" ]; then
+        mv "$MODEL_NAME_OR_PATH.$RUN_ID.json" "$RESULT_OUTPUT_DIR/report.json"
+    fi
+    
+    echo 'Evaluation completed successfully!'
+    cd $WORK_DIR
     
     echo "End-to-end evaluation completed for job ${SLURM_ARRAY_JOB_ID}"
     echo "Results available at: ${WORK_DIR}/evaluation_outputs/swe_bench_e2e_pyxis/job_${SLURM_ARRAY_JOB_ID}/"

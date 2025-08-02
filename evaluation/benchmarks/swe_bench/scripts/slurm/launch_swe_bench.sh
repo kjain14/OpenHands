@@ -4,7 +4,6 @@
 set -e
 
 # Default values
-CONTAINER_IMAGE="ghcr.io/openhands/openhands:latest"
 END_TO_END=false
 EVAL_ENVIRONMENT="local"
 MAX_PARALLEL=50
@@ -29,7 +28,6 @@ Arguments:
     SPLIT           Dataset split (e.g., test)
 
 Options:
-    --container-image IMG   Container image to use (default: ghcr.io/openhands/openhands:latest)
     --end-to-end            Run complete pipeline: inference + evaluation (default: inference only)
     --eval-env ENV          Evaluation environment: local or modal (default: local)
     --mode MODE             Evaluation mode (default: swe)
@@ -53,9 +51,6 @@ Examples:
     # Basic usage
     $0 llm-config.json CodeActAgent princeton-nlp/SWE-bench_Lite test
 
-    # With custom container image
-    $0 --container-image my-custom-image:latest llm-config.json CodeActAgent princeton-nlp/SWE-bench_Lite test
-
     # With custom parameters
     $0 --mode swt --max-iter 200 --gpu --max-parallel 20 llm-config.json CodeActAgent princeton-nlp/SWE-bench test
 
@@ -67,10 +62,6 @@ EOF
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --container-image)
-            CONTAINER_IMAGE="$2"
-            shift 2
-            ;;
         --end-to-end)
             END_TO_END=true
             shift
@@ -150,7 +141,7 @@ if [ ! -f "$MODEL_CONFIG" ]; then
     exit 1
 fi
 
-# Get absolute path to OpenHands root
+# Get absolute path to  root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPENHANDS_ROOT="$(cd "$SCRIPT_DIR/../../../../../" && pwd)"
 
@@ -161,7 +152,6 @@ echo "Dataset: $DATASET"
 echo "Split: $SPLIT"
 echo "Mode: $MODE"
 echo "Max iterations: $MAX_ITER"
-echo "Container image: $CONTAINER_IMAGE"
 echo "End-to-end: $END_TO_END"
 if [ "$END_TO_END" = true ]; then
     echo "Evaluation environment: $EVAL_ENVIRONMENT"
@@ -200,13 +190,13 @@ fi
 
 # SBATCH arguments are now handled dynamically in the generated script
 
-# Choose the appropriate SLURM script
+# Choose the appropriate SLURM script (using refactored versions without container nesting)
 if [ "$END_TO_END" = true ]; then
     SLURM_SCRIPT="$SCRIPT_DIR/run_swe_bench_end_to_end_pyxis.sh"
-    SCRIPT_ARGS="$MODEL_CONFIG $AGENT $DATASET $SPLIT $MODE $MAX_ITER $CONTAINER_IMAGE $EVAL_ENVIRONMENT"
+    SCRIPT_ARGS="$MODEL_CONFIG $AGENT $DATASET $SPLIT $MODE $MAX_ITER $EVAL_ENVIRONMENT"
 else
     SLURM_SCRIPT="$SCRIPT_DIR/run_swe_bench_pyxis.sh"
-    SCRIPT_ARGS="$MODEL_CONFIG $AGENT $DATASET $SPLIT $MODE $MAX_ITER $CONTAINER_IMAGE"
+    SCRIPT_ARGS="$MODEL_CONFIG $AGENT $DATASET $SPLIT $MODE $MAX_ITER"
 fi
 
 echo "Submitting SLURM job..."
@@ -275,7 +265,6 @@ cat > "$JOB_INFO_FILE" << EOF
     "use_pyxis": true,
     "end_to_end": $END_TO_END,
     "eval_environment": "$EVAL_ENVIRONMENT",
-    "container_image": "$CONTAINER_IMAGE",
     "array_size": $ARRAY_SIZE,
     "max_parallel": $MAX_PARALLEL,
     "submitted_at": "$(date -Iseconds)",

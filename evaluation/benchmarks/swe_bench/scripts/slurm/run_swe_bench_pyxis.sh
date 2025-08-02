@@ -1,5 +1,6 @@
 #!/bin/bash
 # SWE-Bench evaluation script for SLURM with Pyxis (inference only)
+# This script runs natively on the host but uses Pyxis containers for each instance
 # SBATCH directives are handled dynamically by the launcher script
 
 # Parse command line arguments
@@ -9,10 +10,9 @@ DATASET=$3
 SPLIT=$4
 MODE=${5:-swe}
 MAX_ITER=${6:-100}
-CONTAINER_IMAGE=${7:-"ghcr.io/openhands/openhands:latest"}
 
 if [ -z "$MODEL_CONFIG" ] || [ -z "$AGENT" ] || [ -z "$DATASET" ] || [ -z "$SPLIT" ]; then
-    echo "Usage: $0 MODEL_CONFIG AGENT DATASET SPLIT [MODE] [MAX_ITER] [CONTAINER_IMAGE]"
+    echo "Usage: $0 MODEL_CONFIG AGENT DATASET SPLIT [MODE] [MAX_ITER]"
     echo "Example: $0 llm-config.json CodeActAgent princeton-nlp/SWE-bench_Lite test"
     exit 1
 fi
@@ -31,18 +31,17 @@ export EVAL_OUTPUT_DIR="/workspace/evaluation_outputs/swe_bench_pyxis/job_${SLUR
 # Get instance ID for this array task
 INSTANCE_LIST_FILE="${WORK_DIR}/evaluation_outputs/swe_bench_pyxis/job_${SLURM_ARRAY_JOB_ID}/instance_list.json"
 
-# On first run (task 0), create instance list
+# On first run (task 0), create instance list natively on host
 if [ $SLURM_ARRAY_TASK_ID -eq 0 ] && [ ! -f "$INSTANCE_LIST_FILE" ]; then
     mkdir -p $(dirname $INSTANCE_LIST_FILE)
     
-    # Run instance list creation in container
-    srun --container-image="$CONTAINER_IMAGE" \
-         --container-mounts="$OPENHANDS_ROOT:/workspace,$WORK_DIR/evaluation_outputs:/workspace/evaluation_outputs" \
-         --container-workdir="/workspace" \
-         python evaluation/benchmarks/swe_bench/scripts/slurm/create_instance_list.py \
+    # Run instance list creation directly on host
+    cd $OPENHANDS_ROOT
+    python evaluation/benchmarks/swe_bench/scripts/slurm/create_instance_list.py \
          --dataset "$DATASET" \
          --split "$SPLIT" \
-         --output "/workspace/evaluation_outputs/swe_bench_pyxis/job_${SLURM_ARRAY_JOB_ID}/instance_list.json"
+         --output "${INSTANCE_LIST_FILE}"
+    cd $WORK_DIR
 fi
 
 # Wait for instance list to be created
@@ -58,7 +57,7 @@ if [ ! -f "$INSTANCE_LIST_FILE" ]; then
     exit 1
 fi
 
-# Get the specific instance for this array task
+# Get the specific instance for this array task (run on host)
 INSTANCE_ID=$(python -c "
 import json
 with open('$INSTANCE_LIST_FILE', 'r') as f:
@@ -74,8 +73,18 @@ fi
 
 echo "Processing instance: $INSTANCE_ID (task $SLURM_ARRAY_TASK_ID)"
 
-# Run the evaluation in pyxis container with local runtime
-srun --container-image="$CONTAINER_IMAGE" \
+# Get the instance-specific Docker image
+INSTANCE_IMAGE=$(cd $OPENHANDS_ROOT && python -c "
+import sys
+sys.path.append('.')
+from evaluation.benchmarks.swe_bench.run_infer import get_instance_docker_image
+print(get_instance_docker_image('$INSTANCE_ID'))
+")
+
+echo "Using instance image: $INSTANCE_IMAGE"
+
+# Run the evaluation in the instance-specific pyxis container
+srun --container-image="$INSTANCE_IMAGE" \
      --container-mounts="$OPENHANDS_ROOT:/workspace,$WORK_DIR/evaluation_outputs:/workspace/evaluation_outputs" \
      --container-workdir="/workspace" \
      --container-env="INSTANCE_ID=$INSTANCE_ID,RUNTIME=local" \
